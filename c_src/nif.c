@@ -26,6 +26,12 @@
 %% THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#ifdef _WIN32  
+#   define WIN32_LEAN_AND_MEAN  
+#   include <Windows.h>  
+#   pragma comment(lib, "erts_MD.lib")  
+#endif  
+
 #include <sys/types.h>
 #include <string.h>
 #include <unistd.h>
@@ -45,6 +51,41 @@
 #include "uthash.h"
 
 #include "erl_nif.h"
+
+
+
+#define BILLION                             (1E9)
+
+static BOOL g_first_time = 1;
+static LARGE_INTEGER g_counts_per_sec;
+
+int clock_gettime(int dummy, struct timespec *ct)
+{
+	LARGE_INTEGER count;
+
+	if (g_first_time)
+	{
+		g_first_time = 0;
+
+		if (0 == QueryPerformanceFrequency(&g_counts_per_sec))
+		{
+			g_counts_per_sec.QuadPart = 0;
+		}
+	}
+
+	if ((NULL == ct) || (g_counts_per_sec.QuadPart <= 0) ||
+		(0 == QueryPerformanceCounter(&count)))
+	{
+		return -1;
+	}
+
+	ct->tv_sec = count.QuadPart / g_counts_per_sec.QuadPart;
+	ct->tv_nsec = ((count.QuadPart % g_counts_per_sec.QuadPart) * BILLION) / g_counts_per_sec.QuadPart;
+
+	return 0;
+}
+
+
 
 /*
    * 2q cache made using TAILQs
@@ -194,7 +235,7 @@ clock_now(struct timespec *ts)
 	ts->tv_sec = mts.tv_sec;
 	ts->tv_nsec = mts.tv_nsec;
 #else
-	clock_gettime(CLOCK_MONOTONIC, ts);
+	clock_gettime(1, ts);
 #endif
 }
 
@@ -220,7 +261,7 @@ destroy_cache_node(struct cache_node *n)
 			nextin = TAILQ_NEXT(in, entry);
 			if (in->node == n) {
 				TAILQ_REMOVE(&(n->c->incr_head[i]), in, entry);
-				__sync_sub_and_fetch(&(n->c->incr_count), 1);
+				InterlockedDecrement(&(n->c->incr_count));
 				in->node = 0;
 				enif_free(in);
 			}
@@ -254,7 +295,7 @@ cache_bg_thread(void *arg)
 		/* sleep until there is work to do */
 		enif_cond_wait(c->check_cond, c->ctrl_lock);
 
-		__sync_add_and_fetch(&(c->wakeups), 1);
+		InterlockedIncrement(&(c->wakeups));
 		dud = 1;
 
 		/* we have to let go of ctrl_lock so we can take cache_lock then
@@ -270,7 +311,7 @@ cache_bg_thread(void *arg)
 				struct cache_incr_node *n;
 				n = TAILQ_FIRST(&(c->incr_head[i]));
 				TAILQ_REMOVE(&(c->incr_head[i]), n, entry);
-				__sync_sub_and_fetch(&(c->incr_count), 1);
+				InterlockedDecrement(&(c->incr_count));
 
 				dud = 0;
 
@@ -350,7 +391,7 @@ cache_bg_thread(void *arg)
 		}
 
 		if (dud)
-			__sync_add_and_fetch(&(c->dud_wakeups), 1);
+			InterlockedDecrement(&(c->dud_wakeups));
 		/* now let go of the cache_lock that we took right back at the start of
 		   this iteration */
 		enif_rwlock_rwunlock(c->cache_lock);
@@ -596,9 +637,9 @@ stats(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 		enif_rwlock_rlock(c->cache_lock);
 		q1s = enif_make_uint64(env, c->q1.size);
 		q2s = enif_make_uint64(env, c->q2.size);
-		incrs = enif_make_uint64(env, __sync_fetch_and_add(&(c->incr_count), 0));
-		wakeups = enif_make_uint64(env, __sync_fetch_and_add(&(c->wakeups), 0));
-		duds = enif_make_uint64(env, __sync_fetch_and_add(&(c->dud_wakeups), 0));
+		incrs = enif_make_uint64(env, InterlockedExchangeAdd(&(c->incr_count), 0));
+		wakeups = enif_make_uint64(env, InterlockedExchangeAdd(&(c->wakeups), 0));
+		duds = enif_make_uint64(env, InterlockedExchangeAdd(&(c->dud_wakeups), 0));
 		enif_rwlock_runlock(c->cache_lock);
 		ret = enif_make_tuple7(env,
 			enif_make_uint64(env, c->hit),
@@ -719,7 +760,7 @@ get(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 		HASH_FIND(hh, c->lookup, kbin.data, kbin.size, n);
 		if (!n) {
 			enif_rwlock_runlock(c->lookup_lock);
-			__sync_add_and_fetch(&c->miss, 1);
+			InterlockedIncrement(&c->miss);
 			enif_consume_timeslice(env, 10);
 			return enif_make_atom(env, "notfound");
 		}
@@ -728,7 +769,7 @@ get(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 			clock_now(&now);
 			if (n->expiry.tv_sec < now.tv_sec) {
 				enif_rwlock_runlock(c->lookup_lock);
-				__sync_add_and_fetch(&c->miss, 1);
+				InterlockedIncrement(&c->miss);
 				enif_consume_timeslice(env, 10);
 				return enif_make_atom(env, "notfound");
 			}
@@ -737,14 +778,14 @@ get(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 		in = enif_alloc(sizeof(*in));
 		memset(in, 0, sizeof(*in));
 		in->node = n;
-		__sync_add_and_fetch(&c->hit, 1);
+		InterlockedIncrement(&c->hit);
 
 		tid = enif_thread_self();
 		HASH_SFH(&tid, sizeof(ErlNifTid), N_INCR_BKT, hashv, bkt);
 		enif_mutex_lock(c->incr_lock[bkt]);
 		TAILQ_INSERT_TAIL(&(c->incr_head[bkt]), in, entry);
 		enif_mutex_unlock(c->incr_lock[bkt]);
-		incrqs = __sync_add_and_fetch(&(c->incr_count), 1);
+		incrqs = InterlockedIncrement(&(c->incr_count));
 
 		ret = enif_make_resource_binary(env, n->val, n->val, n->vsize);
 		enif_rwlock_runlock(c->lookup_lock);
